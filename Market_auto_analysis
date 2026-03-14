@@ -37,8 +37,8 @@ class BotTradingM5():
         self.RISK_PCT = 1.0
         if self.symbol.Name.startswith("US"):
             self.RISK_PCT = 0.5
-        self.PRICE_SAMPLE_BOOTSTRAP = 2 #Secondi per i primi 50 prezzi
-        self.PRICE_SAMPLE_NORMAL = 15
+        self.PRICE_SAMPLE_BOOTSTRAP = 2 #Segundo para los primeros 50 datos de precio
+        self.PRICE_SAMPLE_NORMAL = 15 #Segundo entre toma de dato de precio
         self.MIN_PRICES = 55
         self.MAX_SL_PIPS = 27
         self.sl_min = 15
@@ -48,23 +48,23 @@ class BotTradingM5():
         self.pause_bars_remaining = 0
         self.planned_entry_price = 0
         self.planned_sl_pips = 0
-        # ===== CONTROLLO DOPPIA ENTRATA =====
+        # ===== CONTROL DOBLE ENTRADA =====
         self.order_lock = False
         self.last_entry_time = None
-        # ===== STATO SEGNALI (COMUNICAZIONE ON_BAR -> ON_TICK) =====
+        # ===== COMUNICACIÓN ENTRE ON_BAR -> ON_TICK) =====
         self.signal_mode = None   # "LONG", "SHORT", o None
-        self.signal_price = 0.0   # Prezzo di entrata calcolato
-        self.signal_sl_ref = 0.0  # Riferimento per SL (Low/High candela)
+        self.signal_price = 0.0   # Precio de entrada calculado
+        self.signal_sl_ref = 0.0  # Precio referencia para Stop Loss
         # ===== BUFFER PREZZI 15s =====
         self.prices_15s = []
         self.last_sample_ts = api.Server.Time
         self.ready= False
         # ===== BUFFER LOG 5s =====
         self.last_log_time = api.Server.Time
-        self.LOG_INTERVAL = 8   # secondi
-        # ===== PARAMETRI=====
+        self.LOG_INTERVAL = 8   #Segundos entre registros
+        # ===== PARAMETROS=====
         self.near_tp_reaches = set()
-        # ===== CONTROLLO STOP CONSECUTIVI=====
+        # ===== CONTROL STOP CONSECUTIVOS=====
         self.last_stop_reset_day = api.Server.Time.Day
         # ===== VOLUME =====
         self.min_volume = self.symbol.VolumeInUnitsMin
@@ -73,7 +73,7 @@ class BotTradingM5():
         self._bias_violation_count = 0
         self._bias_candle_count = 0
         self.bbw_invalidated = False
-        #== PARAMETRI TRIGGER ========= LIMITI
+        #== PARAMETROS TRIGGER ========= LIMITES
         self.adx_min  = 45     
         self.adx_max  = 80   
 
@@ -84,8 +84,8 @@ class BotTradingM5():
         self.hurst_buono = 0.70 
 
         self.hacc_decel= -0.05
-        self.hacc_min= 0.10   # soglia bassa per scoring
-        self.hacc_alto= 0.80   # soglia alta per doppio punto
+        self.hacc_min= 0.10   
+        self.hacc_alto= 0.80   
         self.hacc_acc_anomalo = 2.5
         self._h_buffer = []
         self._ha_buffer = []
@@ -95,13 +95,13 @@ class BotTradingM5():
         self.last_loss_price_zone = None
         self.loss_zone_timestamp = None
         self.ZONE_TOLERANCE_PIPS = 20
-        self.ZONE_EXPIRY_BARS = 20  # Zona valida per 20 candele M5 = 100 minuti
+        self.ZONE_EXPIRY_BARS = 20  
         api.Print("AdvancedStrategyBot avviato")
     # ====================================================== 
     # HELPER SICUREZZA 
     # ====================================================== 
     def safe_value(self, val, default=0.0): 
-        """Restituisce un valore sicuro (mai NaN o None).""" 
+        """Devuelve un valor seguro (mai NaN o None).""" 
         if val is None: 
             return default 
         if isinstance(val, float) and math.isnan(val): 
@@ -109,31 +109,30 @@ class BotTradingM5():
         return val
 
     def _is_in_loss_zone(self, current_price):
-        """Evita di rientrare nella fascia di prezzo dove si è perso di recente."""
+        """Evita de volver a entrar en la misma zona del anterior Stop Loss."""
         if self.last_loss_price_zone is None:
             return False
         distance_pips = abs(current_price - self.last_loss_price_zone) / self.symbol.PipSize
         return distance_pips < self.ZONE_TOLERANCE_PIPS
     # ======================================================
-    # ON BAR (IL CERVELLO - CALCOLI PESANTI)
+    # ON BAR (EL CEREBRO)
     # ======================================================
     def on_bar(self):
         try:
-            # ===== 🆕 GESTIONE PAUSA (PRIMA DI TUTTO!) =====
+            # ===== 🆕 GESTION PAUSA =====
             if self.pause_bars_remaining > 0:
                 self.pause_bars_remaining -= 1                
                 if self.pause_bars_remaining > 0:
-                    # Ancora in pausa
-                    api.Print(f"⏸️ PAUSA: {self.pause_bars_remaining} candele rimaste")
+                    # Aun en pausa
+                    api.Print(f"⏸️ PAUSA: {self.pause_bars_remaining} velas que quedan")
                     api.Chart.DrawStaticText("PAUSE_STATUS", 
-                        f"⏸️ PAUSA: {self.pause_bars_remaining}/2 candele", 
+                        f"⏸️ PAUSA: {self.pause_bars_remaining}/2 velas", 
                         VerticalAlignment.Top, 
                         HorizontalAlignment.Left, 
                         Color.Yellow)
-                    return  # SKIP tutto il resto!
-                else:
-                    # Pausa terminata
-                    api.Print("✅ PAUSA TERMINATA - Bot riattivato")
+                    return  
+                else:               
+                    api.Print("✅ PAUSA TERMINADA")
                     api.Chart.RemoveObject("PAUSE_STATUS")
             # ===== SCADENZA LOSS ZONE =====
             if self.loss_zone_timestamp is not None:
@@ -174,7 +173,7 @@ class BotTradingM5():
             api.Print(f"ERR ON_BAR: {e}")
             api.Print(traceback.format_exc())
     # ======================================================
-    # TICK (MOTORE CENTRALIZZATO)
+    # TICK SISTEMA DE PROTECCIÓN
     # ======================================================
     def on_tick(self):
         try:
@@ -197,7 +196,7 @@ class BotTradingM5():
             # Se non siamo pronti o cTrader non ha caricato le barre, stop.
             if not self.ready or api.Bars.Count < 60: return
             # ==========================================================
-            # 2. CALCOLO DATI & INDICATORI (Se siamo in un operazione)
+            # 2. CALCOLO DATOS E INDICADORES
             # ==========================================================            
             # A. Scarichiamo solo gli ultimi 60 dati M5 (Slice Veloce)
             pos = self.get_position()  
@@ -224,7 +223,7 @@ class BotTradingM5():
             api.Print(f"ERR ON_TICK: {e}")
             api.Print(traceback.format_exc())     
     # ======================================================
-    # ENTRY LOGIC 
+    # LOGICA DE ACCION (PRINCIPAL)
     # ======================================================
     def check_entry(self, current_bid, current_ask, prices, open_, high, low, close, atr, ema_fast_5m, ema_slow_5m, ema_fast):
         now = api.Server.Time
@@ -275,7 +274,7 @@ class BotTradingM5():
         if any(x is None for x in (ema_fast[-1], ema_fast_5m[-1], ema_slow_5m[-1], atr[-1])):
             return
         # ==========================================================
-        # 1. AGGIORNAMENTO STATO (LOCK)
+        # CALCULOS PRINCIPALES
         # ==========================================================
         if self.trend_bias == "NEUTRAL":
             self.check_setup(close, high, low, ema_fast_5m, ema_slow_5m, atr)
@@ -365,7 +364,7 @@ class BotTradingM5():
                     if result.IsSuccessful:
                         api.Print(f"⏳ TRAPPOLA SHORT PIAZZATA @ {entry_price}")
 # ======================================================
-# GESTIONE POSIZIONE
+# GESTION POSICION
 # ======================================================
     def manage_position(self, pos, open_, close, atr, ema_fast, ema_fast_5m, prices):
         if pos is None or pos.VolumeInUnits <= 0:
@@ -386,14 +385,11 @@ class BotTradingM5():
         else:
             prezzo = self.symbol.Ask
             profit_R = (entry - prezzo) / rischio
-            pips_gain = (entry - prezzo) / self.symbol.PipSize
-        # ======================================================
-        # 2. LOGICHE ESISTENTI (Early Exit & Timeout)
-        # ======================================================      
+            pips_gain = (entry - prezzo) / self.symbol.PipSize     
         if profit_R >= 0.5:
             self.near_tp_reaches.add(pos.Id)
         # ===============================
-        # INVERSIONE CHIARA
+        # INVERSION 
         # ===============================
         if pos.Id in self.near_tp_reaches:
             if pos.TradeType == TradeType.Buy:
@@ -510,7 +506,7 @@ class BotTradingM5():
                         api.CancelPendingOrder(order)
                 return        
     # ======================================================
-    # APERTURA POSIZIONE
+    # ABERTURA POSICIÓN
     # ======================================================
     def OnPositionOpened(self, args):
         position = args.Position
@@ -519,7 +515,7 @@ class BotTradingM5():
             self.order_lock = True # Manteniamo il lock per non aprire altro
             self.last_entry_time = api.Server.Time
             # ========================================
-            # CORREZIONE SL SE SLIPPAGE
+            # Re CALCULO SL SE SLIPPAGE
             # ========================================           
             if hasattr(self, 'planned_entry_price') and hasattr(self, 'planned_sl_pips'):               
                 entry_real = position.EntryPrice
@@ -578,7 +574,7 @@ class BotTradingM5():
                 #api.Print(f"   RR: {tp_real_pips / sl_real_pips:.2f}")
             api.Print(f"✅ TRAPPOLA SCATTATA: Ordine {position.Id} Eseguito.")
     # ======================================================
-    # CHIUSURA POSIZIONE
+    # CIERRE POSICIÓN
     # ======================================================
     def OnPositionClosed(self, args):
         position = args.Position
@@ -615,9 +611,6 @@ class BotTradingM5():
                     r_mult = (chiusura_effettiva - position.EntryPrice) / risk_price
                 else:
                     r_mult = (position.EntryPrice - chiusura_effettiva) / risk_price
-
-        # 4. LOG PROFESSIONALE CON ESITO NATIVO
-        # args.Reason ti dirà esattamente: "StopLoss", "TakeProfit", "Closed" (chiuso a mercato dal bot), o "StopOut"
         esito_str = str(reason).upper()
         icona = "✅" if pnl_reale > 0 else "❌"
         api.Print("=== POSIZIONE CHIUSA ===")
@@ -673,6 +666,11 @@ class BotTradingM5():
             self.last_log_time = now
 
     def calc_volume(self, SL_PIPS, multiplier = 1.0):
+        """
+        Calcula el tamaño de la posición usando gestión de riesgo fraccionario fijo.
+        Riesgo = Balance de cuenta * porcentaje_riesgo * multiplicador.
+        El volumen se normaliza al tamaño mínimo de paso del broker.
+        """
         try:
             capital = min(self.account.Balance, self.account.Equity)
             effective_risck_pct = self.RISK_PCT * multiplier
@@ -688,9 +686,10 @@ class BotTradingM5():
             return 0
 
     def check_daily_stop_limit(self, max_stops):
-        """
-        Nuovo comportamento: dopo 1 SL, pausa fino a fine giornata.
-        Dopo 2 SL totali (inclusi i giornalieri accumulati), stop totale.
+       """
+        Circuit breaker diario: bloquea el bot tras el primer stop loss del día.
+        Evita el efecto de 'revenge trading' acumulando pérdidas consecutivas.
+        Devuelve True si se ha alcanzado el límite, False si se puede seguir operando.
         """
         stops_today = 0
         today = api.Server.Time.Date
@@ -903,13 +902,17 @@ class BotTradingM5():
         return start_condition and end_condition
 
     def get_monthly_status(self, profit_target_pct=5.0, soft_dd_pct=2.0, hard_dd_pct=4.0):
+            """
+        Sistema de gestión de capital mensual con múltiples niveles.
+        Devuelve:
+            0   → Riesgo normal
+            0.5 → Modo recuperación (riesgo reducido a la mitad, drawdown > 2%)
+            1   → Profit lock (objetivo mensual alcanzado, luego stop loss)
+            2   → Stop total (pérdida máxima mensual > 4% alcanzada)
+        Incluye lógica de reset: si ocurren 2 take-profits consecutivos
+        durante el modo recuperación, el riesgo vuelve a la normalidad.
         """
-        Gestisce lo stato del mese con logica RESET su 2 TP consecutivi.
-        - Restituisce 0: Rischio Normale (1.0)
-        - Restituisce 1: Profit Lock (Target Mensile Raggiunto)
-        - Restituisce 2: Hard Stop (Mese Perso > 4%)
-        - Restituisce 0.5: Recovery Mode (Rischio Dimezzato > 2%)
-        """
+
         # Accesso sicuro ai dati globali cTrader
         now = api.Server.Time
         current_month = now.Month
@@ -990,7 +993,14 @@ class BotTradingM5():
         rank = sum(1 for v in recent if v <= current)
         return (rank / period) * 100
 
-    def get_fractal_efficiency(self, close, period=10): #Quanto è efficiente il movimento? Va dritto o zigzaga?
+    def get_fractal_efficiency(self, close, period=10):
+         """
+        Mide qué tan 'dirigido' es un movimiento de precio frente al ruido caótico.
+        Valor cercano a 1.0 = tendencia fuerte (movimiento recto)
+        Valor cercano a 0.0 = mercado caótico / lateral
+        Análogo a las métricas de eficiencia usadas en análisis de
+        secuencias genómicas para detectar regiones ordenadas vs desordenadas.
+        """
         change = abs(close[-1] - close[-period]) # Spostamento netto
         path_length = 0.0       
         for i in range(1, period + 1):
@@ -1068,7 +1078,13 @@ class BotTradingM5():
         return acceleration
 
     def calc_ADX(self, high, low, close, period=14):
-        """ADX con smoothing Wilder corretto. Restituisce (adx, plus_di, minus_di)."""
+         """
+    Implementación manual del indicador ADX de Wilder.
+    Mide la fuerza de la tendencia independientemente de su dirección.
+    Se usa como filtro de entrada: solo se opera cuando el ADX
+    está entre 25 y 65, evitando mercados sin tendencia y tendencias agotadas.
+    Devuelve: (adx, plus_di, minus_di)
+    """
         if len(close) < period * 2 + 1:
             return 0.0, 0.0, 0.0
 
