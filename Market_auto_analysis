@@ -1,0 +1,1280 @@
+import clr
+clr.AddReference("cAlgo.API")
+from cAlgo.API import *
+from datetime import datetime, timedelta
+import math
+import traceback
+class BotTradingM5():
+    # ======================================================
+    # START     
+    # ======================================================
+    def on_start(self):
+        api.Positions.Closed += self.OnPositionClosed
+        api.Positions.Opened += self.OnPositionOpened
+        self.symbol = api.Symbol
+        self.account = api.Account
+        # ===== PARAMETRI =====
+        self.RISK_PCT = 1.0
+        if self.symbol.Name.startswith("US"):
+            self.RISK_PCT = 0.5
+        self.PRICE_SAMPLE_BOOTSTRAP = 2 #Secondi per i primi 50 prezzi
+        self.PRICE_SAMPLE_NORMAL = 15
+        self.MIN_PRICES = 55
+        self.MAX_SL_PIPS = 27
+        self.sl_min = 15
+        self.rr = 1.8
+        self.periodo_fast = 15
+        self.periodo_slow = 35
+        self.pause_bars_remaining = 0
+        self.planned_entry_price = 0
+        self.planned_sl_pips = 0
+        # ===== CONTROLLO DOPPIA ENTRATA =====
+        self.order_lock = False
+        self.last_entry_time = None
+        # ===== STATO SEGNALI (COMUNICAZIONE ON_BAR -> ON_TICK) =====
+        self.signal_mode = None   # "LONG", "SHORT", o None
+        self.signal_price = 0.0   # Prezzo di entrata calcolato
+        self.signal_sl_ref = 0.0  # Riferimento per SL (Low/High candela)
+        # ===== BUFFER PREZZI 15s =====
+        self.prices_15s = []
+        self.last_sample_ts = api.Server.Time
+        self.ready= False
+        # ===== BUFFER LOG 5s =====
+        self.last_log_time = api.Server.Time
+        self.LOG_INTERVAL = 8   # secondi
+        # ===== PARAMETRI=====
+        self.near_tp_reaches = set()
+        # ===== CONTROLLO STOP CONSECUTIVI=====
+        self.last_stop_reset_day = api.Server.Time.Day
+        # ===== VOLUME =====
+        self.min_volume = self.symbol.VolumeInUnitsMin
+        #== SETUP HOLDING ==
+        self.trend_bias = "NEUTRAL"
+        self._bias_violation_count = 0
+        self._bias_candle_count = 0
+        self.bbw_invalidated = False
+        #== PARAMETRI TRIGGER ========= LIMITI
+        self.adx_min  = 45     
+        self.adx_max  = 80   
+
+        self.vol_pct_min  = 5  
+
+        self.hurst_min  = 0.30  
+        self.hurst_max  = 0.78  
+        self.hurst_buono = 0.70 
+
+        self.hacc_decel= -0.05
+        self.hacc_min= 0.10   # soglia bassa per scoring
+        self.hacc_alto= 0.80   # soglia alta per doppio punto
+        self.hacc_acc_anomalo = 2.5
+        self._h_buffer = []
+        self._ha_buffer = []
+        self._adx_buffer = []
+
+        # ===== LOSS ZONE MEMORY =====
+        self.last_loss_price_zone = None
+        self.loss_zone_timestamp = None
+        self.ZONE_TOLERANCE_PIPS = 20
+        self.ZONE_EXPIRY_BARS = 20  # Zona valida per 20 candele M5 = 100 minuti
+        api.Print("AdvancedStrategyBot avviato")
+    # ====================================================== 
+    # HELPER SICUREZZA 
+    # ====================================================== 
+    def safe_value(self, val, default=0.0): 
+        """Restituisce un valore sicuro (mai NaN o None).""" 
+        if val is None: 
+            return default 
+        if isinstance(val, float) and math.isnan(val): 
+            return default 
+        return val
+
+    def _is_in_loss_zone(self, current_price):
+        """Evita di rientrare nella fascia di prezzo dove si è perso di recente."""
+        if self.last_loss_price_zone is None:
+            return False
+        distance_pips = abs(current_price - self.last_loss_price_zone) / self.symbol.PipSize
+        return distance_pips < self.ZONE_TOLERANCE_PIPS
+    # ======================================================
+    # ON BAR (IL CERVELLO - CALCOLI PESANTI)
+    # ======================================================
+    def on_bar(self):
+        try:
+            # ===== 🆕 GESTIONE PAUSA (PRIMA DI TUTTO!) =====
+            if self.pause_bars_remaining > 0:
+                self.pause_bars_remaining -= 1                
+                if self.pause_bars_remaining > 0:
+                    # Ancora in pausa
+                    api.Print(f"⏸️ PAUSA: {self.pause_bars_remaining} candele rimaste")
+                    api.Chart.DrawStaticText("PAUSE_STATUS", 
+                        f"⏸️ PAUSA: {self.pause_bars_remaining}/2 candele", 
+                        VerticalAlignment.Top, 
+                        HorizontalAlignment.Left, 
+                        Color.Yellow)
+                    return  # SKIP tutto il resto!
+                else:
+                    # Pausa terminata
+                    api.Print("✅ PAUSA TERMINATA - Bot riattivato")
+                    api.Chart.RemoveObject("PAUSE_STATUS")
+            # ===== SCADENZA LOSS ZONE =====
+            if self.loss_zone_timestamp is not None:
+                bars_since_loss = (api.Server.Time - self.loss_zone_timestamp).TotalMinutes / 5
+                if bars_since_loss > self.ZONE_EXPIRY_BARS:
+                    self.last_loss_price_zone = None
+                    self.loss_zone_timestamp = None
+                    
+            if self.has_position() or self.has_pending_order():
+                return
+            # 1. Reset Segnali della barra precedente
+            self.signal_mode = None
+            self.signal_price = 0.0  
+            current_bid = self.symbol.Bid
+            current_ask = self.symbol.Ask
+            # 2. Controllo Dati Minimi
+            bars = api.Bars
+            if bars.Count < 60: return
+            # 3. Estrazione Dati (Solo una volta per barra!)
+            prices = self.prices_15s  
+            # Nota: In on_bar, l'indice -1 è la barra appena chiusa (quella che ci interessa)
+            count = bars.Count
+            start_idx = count - 60
+            
+            close = [bars.ClosePrices[i] for i in range(start_idx, count)]
+            open_ = [bars.OpenPrices[i] for i in range(start_idx, count)]
+            high = [bars.HighPrices[i] for i in range(start_idx, count)]
+            low = [bars.LowPrices[i] for i in range(start_idx, count)]
+            # 4. Calcolo Indicatori
+            atr = self.calcolo_atr(high, low, close, 10)
+            ema_fast_5m = self.ema(close, self.periodo_fast) # 20
+            ema_slow_5m = self.ema(close, self.periodo_slow) # 40          
+            ema_fast = self.ema(close, 6) # Trigger EMA
+            if ema_slow_5m[-1] is None or atr[-1] is None: return
+            # 5. AGGIORNAMENTO BIAS & CHECK ENTRY
+            self.check_entry(current_bid, current_ask, prices, open_, high, low, close, atr, ema_fast_5m, ema_slow_5m, ema_fast)
+        except Exception as e:
+            api.Print(f"ERR ON_BAR: {e}")
+            api.Print(traceback.format_exc())
+    # ======================================================
+    # TICK (MOTORE CENTRALIZZATO)
+    # ======================================================
+    def on_tick(self):
+        try:
+            now = api.Server.Time     
+            current_bid = self.symbol.Bid
+            current_ask = self.symbol.Ask     
+            # 1. GESTIONE BUFFER 15s (Campionamento)
+            # Calcoliamo l'intervallo dinamico
+            interval = self.PRICE_SAMPLE_BOOTSTRAP if len(self.prices_15s) < self.MIN_PRICES else self.PRICE_SAMPLE_NORMAL            
+            if (now - self.last_sample_ts).TotalSeconds >= interval:
+                self.prices_15s.append(current_bid)
+                self.last_sample_ts = now               
+                # PULIZIA BUFFER (La facciamo solo qui, quando serve!)
+                if len(self.prices_15s) >= 2000:
+                    self.prices_15s = self.prices_15s[-1500:]              
+                # Sblocco iniziale
+                if not self.ready and len(self.prices_15s) >= self.MIN_PRICES:
+                    self.ready = True
+                    api.Print("✅ BUFFER PIENO - READY")
+            # Se non siamo pronti o cTrader non ha caricato le barre, stop.
+            if not self.ready or api.Bars.Count < 60: return
+            # ==========================================================
+            # 2. CALCOLO DATI & INDICATORI (Se siamo in un operazione)
+            # ==========================================================            
+            # A. Scarichiamo solo gli ultimi 60 dati M5 (Slice Veloce)
+            pos = self.get_position()  
+            bars = api.Bars                    
+            prices= self.prices_15s
+            count = bars.Count
+            start_idx = count - 45
+            
+            close_lite = [bars.ClosePrices[i] for i in range(start_idx, count)]
+            open_lite = [bars.OpenPrices[i] for i in range(start_idx, count)]
+            high_lite = [bars.HighPrices[i] for i in range(start_idx, count)]
+            low_lite = [bars.LowPrices[i] for i in range(start_idx, count)]     
+            # Indicatori Veloci
+            atr_lite = self.calcolo_atr(high_lite, low_lite, close_lite, 10)
+            ema_fast_5m_lite = self.ema(close_lite, self.periodo_fast) # 20
+            ema_slow_5m_lite = self.ema(close_lite, self.periodo_slow) # 40
+            ema_fast_lite = self.ema(close_lite, 6)  
+            if ema_slow_5m_lite[-1] is None or atr_lite[-1] is None: return
+            self.manage_bias(close_lite, open_lite, ema_fast_5m_lite, ema_slow_5m_lite, atr_lite)      
+                # Controllo Uscita
+            if pos:
+                self.manage_position(pos, open_lite, close_lite, atr_lite, ema_fast_lite, ema_fast_5m_lite, prices)
+        except Exception as e:
+            api.Print(f"ERR ON_TICK: {e}")
+            api.Print(traceback.format_exc())     
+    # ======================================================
+    # ENTRY LOGIC 
+    # ======================================================
+    def check_entry(self, current_bid, current_ask, prices, open_, high, low, close, atr, ema_fast_5m, ema_slow_5m, ema_fast):
+        now = api.Server.Time
+        current_bar = api.Bars.OpenTimes[-1]
+        # --- RESET STOP GIORNALIERI ---
+        if now.Day != self.last_stop_reset_day:
+            self.last_stop_reset_day = now.Day
+            self.trend_bias = "NEUTRAL"
+            self.last_loss_price_zone = None
+            self.loss_zone_timestamp = None
+            #api.Print("Nuovo giorno: contatore stop resettato.")
+        if not self.trading_setup_allowed():
+            self.trend_bias = "NEUTRAL"
+            return False
+        # --- CONTROLLO CIRCUIT BREAKER ---
+        if self.check_daily_stop_limit(1):
+            api.Chart.DrawStaticText("STOP_STATUS", "MAX DAILY STOPS REACHED (3/3)", VerticalAlignment.Top, HorizontalAlignment.Right, Color.Red)
+            return
+        else:
+            api.Chart.RemoveObject("STOP_STATUS")
+        # ===== GESTIONE MONEY MANAGEMENT MENSILE ====
+        monthly_status = self.get_monthly_status(profit_target_pct=5.0, soft_dd_pct=2.0, hard_dd_pct=4.0)        
+        risk_multiplier = 1.0 # Default normale       
+        if monthly_status == 1:
+            api.Chart.DrawStaticText("MM_STATUS", "🔒 PROFIT LOCK: Mese Chiuso in Verde", VerticalAlignment.Top, HorizontalAlignment.Center, Color.Lime)
+            return
+        elif monthly_status == 2:
+            api.Chart.DrawStaticText("MM_STATUS", "⛔ HARD STOP: Max Loss (-4%) Raggiunto", VerticalAlignment.Top, HorizontalAlignment.Center, Color.Red)
+            return
+        elif monthly_status == 0.5:
+            api.Chart.DrawStaticText("MM_STATUS", "⚠️ RECOVERY MODE: Rischio Dimezzato (-2%)", VerticalAlignment.Top, HorizontalAlignment.Center, Color.Orange)
+            risk_multiplier = 0.5 # DIMEZZA IL RISCHIO
+        else:
+            # Se siamo qui, o va tutto bene, O il rischio è stato resettato dai 2 TP
+            api.Chart.RemoveObject("MM_STATUS")
+            risk_multiplier = 1.0           
+        # --- CONTROLLI PER FAR FUNZIONARE BOT ---       
+        if self.last_entry_time is not None:
+            if (now - self.last_entry_time).TotalSeconds < 10:
+                return   
+        if self.has_pending_order(): return   
+        if self.order_lock and not self.has_position():
+            api.Print(f"Order lock rilasciato")
+            self.order_lock = False
+        if self.order_lock:
+            return
+        #======PRIMI CONTROLLI=====
+        if any(x is None for x in (ema_fast[-1], ema_fast_5m[-1], ema_slow_5m[-1], atr[-1])):
+            return
+        # ==========================================================
+        # 1. AGGIORNAMENTO STATO (LOCK)
+        # ==========================================================
+        if self.trend_bias == "NEUTRAL":
+            self.check_setup(close, high, low, ema_fast_5m, ema_slow_5m, atr)
+        # Visualizzazione stato
+        status_color = Color.Gray
+        if self.trend_bias == "LONG": status_color = Color.Lime
+        elif self.trend_bias == "SHORT": status_color = Color.Red
+        api.Chart.DrawStaticText("BIAS_LOCK", f"BIAS: {self.trend_bias}", VerticalAlignment.Bottom, HorizontalAlignment.Right, status_color)
+        if self.trend_bias == "NEUTRAL": return
+        # ===== ENTRY ===== 
+        if self.trend_bias == "LONG":  
+            is_valid, entry_price, rr = self.early_long_trigger(current_bid, current_ask, prices, ema_fast_5m, ema_slow_5m, open_, high, low, close, atr, ema_fast)              
+            if is_valid:
+                execute_market = False
+                if current_ask > entry_price:
+                    slippage_pips = (current_ask - entry_price) / self.symbol.PipSize
+                    execute_market = True
+                    api.Print(f"🚀 GAP DETECTED: Market Order (slippage: {slippage_pips:.1f}p)")
+                #-- Calcoliamo parametri                              
+                stop_loss_pips = self.planned_sl_pips if hasattr(self, 'planned_sl_pips') else 20.0
+                volume = self.calc_volume(stop_loss_pips, risk_multiplier)
+                if volume < self.symbol.VolumeInUnitsMin:
+                    api.Print(f"VOLUME BLOCCATO: {volume}")
+                    return
+                margin = self.symbol.GetEstimatedMargin(TradeType.Buy, volume)
+                if margin > self.account.FreeMargin * 0.8:
+                    api.Print(f"FreeMargin={self.account.FreeMargin:.2f}")
+                    return
+                if execute_market:
+                    # ENTRATA MARKET (Il treno è già partito, saltiamo su)
+                    api.ExecuteMarketOrder(TradeType.Buy, self.symbol, volume, "AdvancedBot", stop_loss_pips, stop_loss_pips * rr)
+                    self.order_lock = True
+                    self.last_entry_time = api.Server.Time
+                else:
+                    # ENTRATA STOP (Il treno è in stazione, piazziamo la trappola)
+                    expiry = api.Server.Time.AddMinutes(20)
+                    result = api.PlaceStopOrder(
+                                TradeType.Buy,
+                                self.symbol,
+                                volume,
+                                entry_price,
+                                "AdvancedBot",
+                                stop_loss_pips,
+                                stop_loss_pips * rr,
+                                expiry)
+                    self.order_lock = True
+                    self.last_entry_time = api.Server.Time
+                    if result.IsSuccessful:
+                        api.Print(f"⏳ TRAPPOLA LONG PIAZZATA @ {entry_price}")                       
+            # ===== ENTRY SHORT =====
+        elif self.trend_bias == "SHORT":
+            is_valid, entry_price, rr = self.early_short_trigger(current_bid, current_ask, prices, ema_fast_5m, ema_slow_5m, open_, low, high, close, atr, ema_fast)
+            if is_valid:
+                # --- FIX CRITICO ---
+                execute_market = False
+                if current_bid < entry_price:
+                    slippage_pips = (entry_price - current_bid) / self.symbol.PipSize
+                    execute_market = True
+                    api.Print(f"🔻 GAP DETECTED: Market Order (slippage: {slippage_pips:.1f}p)")
+                #-- Calcoliamo parametri
+                stop_loss_pips = self.planned_sl_pips if hasattr(self, 'planned_sl_pips') else 20.0
+                volume = self.calc_volume(stop_loss_pips, risk_multiplier)
+                if volume < self.symbol.VolumeInUnitsMin:
+                    api.Print(f"VOLUME BLOCCATO: {volume}")
+                    return                
+                margin = self.symbol.GetEstimatedMargin(TradeType.Sell, volume)
+                if margin > self.account.FreeMargin * 0.8:
+                    api.Print(f"FreeMargin={self.account.FreeMargin:.2f}")
+                    return
+                if execute_market:
+                    api.ExecuteMarketOrder(TradeType.Sell, self.symbol, volume, "AdvancedBot", stop_loss_pips, stop_loss_pips * rr)
+                    self.order_lock = True
+                    self.last_entry_time = api.Server.Time
+                else:
+                    expiry = api.Server.Time.AddMinutes(20)
+                    result = api.PlaceStopOrder(
+                            TradeType.Sell,
+                            self.symbol,
+                            volume,
+                            entry_price,
+                            "AdvancedBot",
+                            stop_loss_pips,
+                            stop_loss_pips * rr,
+                            expiry)
+                    self.order_lock = True
+                    self.last_entry_time = api.Server.Time
+                    if result.IsSuccessful:
+                        api.Print(f"⏳ TRAPPOLA SHORT PIAZZATA @ {entry_price}")
+# ======================================================
+# GESTIONE POSIZIONE
+# ======================================================
+    def manage_position(self, pos, open_, close, atr, ema_fast, ema_fast_5m, prices):
+        if pos is None or pos.VolumeInUnits <= 0:
+            return
+        now = api.Server.Time
+        durata = (now - pos.EntryTime).TotalSeconds
+        entry = pos.EntryPrice
+        sl = pos.StopLoss      
+        # Controllo sicurezza calcoli
+        if sl is None: return 
+        rischio = abs(entry - sl)
+        if rischio <= 0: return
+        # Prezzo corrente
+        if pos.TradeType == TradeType.Buy:
+            prezzo = self.symbol.Bid
+            profit_R = (prezzo - entry) / rischio
+            pips_gain = (prezzo - entry) / self.symbol.PipSize
+        else:
+            prezzo = self.symbol.Ask
+            profit_R = (entry - prezzo) / rischio
+            pips_gain = (entry - prezzo) / self.symbol.PipSize
+        # ======================================================
+        # 2. LOGICHE ESISTENTI (Early Exit & Timeout)
+        # ======================================================      
+        if profit_R >= 0.5:
+            self.near_tp_reaches.add(pos.Id)
+        # ===============================
+        # INVERSIONE CHIARA
+        # ===============================
+        if pos.Id in self.near_tp_reaches:
+            if pos.TradeType == TradeType.Buy:
+                if self.simple_reversal_long(open_, close, atr, ema_fast, ema_fast_5m):
+                    api.ClosePosition(pos)
+                    api.Print(f"EARLY EXIT SIMPLE | R={profit_R:.2f}")
+                    return
+            else:
+                if self.simple_reversal_short(open_, close, atr, ema_fast, ema_fast_5m):
+                    api.ClosePosition(pos)
+                    api.Print(f"EARLY EXIT SIMPLE | R={profit_R:.2f}")
+                    return
+        # ===============================
+        # TIMEOUT
+        # ===============================
+        MAX_DURATION = 2700 # 1h
+        if durata > MAX_DURATION:
+            if profit_R < 0.1:
+                pos.Close()
+                api.Print(f"TIMEOUT STALL | R={profit_R:.2f} | ID={pos.Id}")
+                return
+        if durata > 5400:
+            result = api.ClosePosition(pos)
+            if result is None or (hasattr(result, 'IsSuccessful') and not result.IsSuccessful):
+                api.Print(f"⚠️ TIMEOUT CLOSE FALLITO — riprovo al prossimo tick")
+            else:
+                api.Print(f"TIMEOUT CLOSE | R={profit_R:.2f}")
+            return
+    def manage_bias(self, close, open_, ema_fast_5m, ema_slow_5m, atr):       
+        atr_current = self.atr_mean(atr, 5)
+        ema_gap_threshold = atr_current * 0.4
+        bb_b, bb_w, bb_w_pct = self.get_bollinger_squeeze(close, 20, 2, 20)
+        
+        # ==== LOGICA RESET LONG ====
+        if self.trend_bias == "LONG":
+            violations = 0
+            
+            # A. EMA cross
+            if ema_fast_5m[-1] < ema_slow_5m[-1] - ema_gap_threshold:
+                violations += 2  # EMA cross è grave, conta doppio
+            
+            # B. Rottura strutturale
+            body_close = close[-1]
+            body_open = open_[-1]
+            candle_close = min(body_close, body_open)
+            reset_threshold = max(self.symbol.PipSize * 15, atr_current * 0.5)
+            if candle_close < ema_slow_5m[-1] - reset_threshold:
+                violations += 1
+            
+            # C. BBW espansione estrema
+            if (bb_w_pct > 90 or bb_w_pct < 20 )and self.bbw_invalidated is False:
+                self.bbw_invalidated = True
+                violations += 1
+            elif self.bbw_invalidated is True and (bb_w_pct < 85 and bb_w_pct > 25):
+                self.bbw_invalidated = False               
+                violations -= 1
+            
+            # Accumula violazioni
+            if violations > 0:
+                self._bias_violation_count += violations
+            else:
+                # Se tutto ok, riduci contatore (ma non sotto zero)
+                self._bias_violation_count = max(0, self._bias_violation_count - 1)
+            
+            # Reset solo con violazioni persistenti
+            if self._bias_violation_count >= 3:
+                self.trend_bias = "NEUTRAL"
+                self._bias_violation_count = 0
+                self._bias_candle_count = 0
+                self.bbw_invalidated = False
+                api.Print("RESET BIAS LONG -> Violazioni accumulate")
+                for order in api.PendingOrders:
+                    if order.Label == "AdvancedBot" and order.TradeType == TradeType.Buy:
+                        api.CancelPendingOrder(order)
+                return
+        
+        # ==== LOGICA RESET SHORT ====
+        elif self.trend_bias == "SHORT":
+            violations = 0
+            
+            # A. EMA cross
+            if ema_fast_5m[-1] > ema_slow_5m[-1] + ema_gap_threshold:
+                violations += 2
+            
+            # B. Rottura strutturale
+            body_close = close[-1]
+            body_open = open_[-1]
+            candle_close = max(body_close, body_open)
+            reset_threshold = max(self.symbol.PipSize * 15, atr_current * 0.5)
+            if candle_close > ema_slow_5m[-1] + reset_threshold:
+                violations += 1
+            
+            # C. BBW espansione estrema
+            if (bb_w_pct > 90 or bb_w_pct < 20) and self.bbw_invalidated is False:
+                self.bbw_invalidated = True
+                violations += 1
+            elif self.bbw_invalidated is True and (bb_w_pct < 85 and bb_w_pct > 25):
+                self.bbw_invalidated = False               
+                violations -= 1
+            
+            if violations > 0:
+                self._bias_violation_count += violations
+            else:
+                self._bias_violation_count = max(0, self._bias_violation_count - 1)
+            
+            if self._bias_violation_count >= 3:
+                self.trend_bias = "NEUTRAL"
+                self._bias_violation_count = 0
+                self._bias_candle_count = 0
+                self.bbw_invalidated = False
+                api.Print("RESET BIAS SHORT -> Violazioni accumulate")
+                for order in api.PendingOrders:
+                    if order.Label == "AdvancedBot" and order.TradeType == TradeType.Sell:
+                        api.CancelPendingOrder(order)
+                return        
+    # ======================================================
+    # APERTURA POSIZIONE
+    # ======================================================
+    def OnPositionOpened(self, args):
+        position = args.Position
+        if position.SymbolName == self.symbol.Name and position.Label == "AdvancedBot":
+            # L'ordine è entrato! Ora gestiamo la posizione.
+            self.order_lock = True # Manteniamo il lock per non aprire altro
+            self.last_entry_time = api.Server.Time
+            # ========================================
+            # CORREZIONE SL SE SLIPPAGE
+            # ========================================           
+            if hasattr(self, 'planned_entry_price') and hasattr(self, 'planned_sl_pips'):               
+                entry_real = position.EntryPrice
+                entry_planned = self.planned_entry_price
+                sl_planned_pips = self.planned_sl_pips
+                
+                # Calcola slippage in pips
+                if position.TradeType == TradeType.Buy:
+                    slippage_pips = (entry_real - entry_planned) / self.symbol.PipSize
+                else:
+                    slippage_pips = (entry_planned - entry_real) / self.symbol.PipSize
+                
+                if abs(slippage_pips) > 9.5:
+                    api.ClosePosition(position)
+                    api.Print(f"(slippage: {slippage_pips:.1f}p)")
+                    api.Print("TRADE ANNULLATO, SLIPPAGE ECCESSIVO")
+                    # ===== 🆕 PAUSA 2 CANDELE =====
+                    self.pause_bars_remaining = 2
+                    api.Print(f"⏸️ PAUSA ATTIVATA: 2 candele (10 min)")
+                    
+                    # Reset lock
+                    self.order_lock = False
+                    return
+                # === 🆕 CORREGGI SEMPRE SL/TP (NON SOLO SE SLIPPAGE) ===
+                # Ricalcola basandosi su entry REALE
+                if position.TradeType == TradeType.Buy:
+                    new_sl_price = entry_real - (sl_planned_pips * self.symbol.PipSize)
+                    new_tp_price = entry_real + (sl_planned_pips * self.rr * self.symbol.PipSize)
+                else:
+                    new_sl_price = entry_real + (sl_planned_pips * self.symbol.PipSize)
+                    new_tp_price = entry_real - (sl_planned_pips * self.rr * self.symbol.PipSize)
+                
+                # Modifica SEMPRE
+                try:
+                    result_1 = position.ModifyStopLossPrice(new_sl_price)
+                    result_2 = position.ModifyTakeProfitPrice(new_tp_price)
+                    sl_failed = (result_1 is None) or (hasattr(result_1, 'IsSuccessful') and not result_1.IsSuccessful)
+                    tp_failed = (result_2 is None) or (hasattr(result_2, 'IsSuccessful') and not result_2.IsSuccessful)
+                    
+                    if sl_failed or tp_failed:
+                        api.Print(f"⚠️ Modifica SL/TP FALLITA — chiudo posizione per sicurezza")
+                        api.ClosePosition(position)
+                        self.pause_bars_remaining = 3
+                        self.order_lock = False
+                        return
+                except Exception as e:
+                    api.Print(f"⚠️ Errore modifica SL/TP: {e}")
+                # === DEBUG ===
+                sl_real_pips = abs(entry_real - new_sl_price) / self.symbol.PipSize
+                tp_real_pips = abs(new_tp_price - entry_real) / self.symbol.PipSize
+                
+                #api.Print(f"🔧 SL/TP IMPOSTATI:")
+                #api.Print(f"   Entry: {entry_real:.2f} (slippage: {slippage_pips:.1f}p)")
+                #api.Print(f"   SL: {new_sl_price:.2f} ({sl_real_pips:.1f}p)")
+                #api.Print(f"   TP: {new_tp_price:.2f} ({tp_real_pips:.1f}p)")
+                #api.Print(f"   RR: {tp_real_pips / sl_real_pips:.2f}")
+            api.Print(f"✅ TRAPPOLA SCATTATA: Ordine {position.Id} Eseguito.")
+    # ======================================================
+    # CHIUSURA POSIZIONE
+    # ======================================================
+    def OnPositionClosed(self, args):
+        position = args.Position
+        reason = args.Reason 
+
+        # Filtro base
+        if position.SymbolName != self.symbol.Name or position.Label != "AdvancedBot":
+            return
+
+        # SBLOCCO IMMEDIATO DEL MOTORE
+        self.order_lock = False
+        self.last_entry_time = None
+
+        # 2. Recupero dati dallo Storico (History) per i dati finanziari esatti
+        closed_trade = None
+        history_len = api.History.Count
+        # Ciclo al contrario in modo sicuro per Python/C# interop
+        for i in range(history_len - 1, -1, -1):
+            trade = api.History[i]
+            if trade.PositionId == position.Id:
+                closed_trade = trade
+                break                
+        if not closed_trade:
+            api.Print(f"⚠️ Errore Log: Trade {position.Id} non trovato in History.")
+            return
+        chiusura_effettiva = closed_trade.ClosingPrice
+        pnl_reale = closed_trade.NetProfit
+        # 3. Calcolo R-Multiple (Matematica blindata)
+        r_mult = 0.0
+        if position.StopLoss is not None:
+            risk_price = abs(position.EntryPrice - position.StopLoss)
+            if risk_price > 0:
+                if position.TradeType == TradeType.Buy:
+                    r_mult = (chiusura_effettiva - position.EntryPrice) / risk_price
+                else:
+                    r_mult = (position.EntryPrice - chiusura_effettiva) / risk_price
+
+        # 4. LOG PROFESSIONALE CON ESITO NATIVO
+        # args.Reason ti dirà esattamente: "StopLoss", "TakeProfit", "Closed" (chiuso a mercato dal bot), o "StopOut"
+        esito_str = str(reason).upper()
+        icona = "✅" if pnl_reale > 0 else "❌"
+        api.Print("=== POSIZIONE CHIUSA ===")
+        api.Print(f"Esito  : {esito_str} {icona}")
+        api.Print(f"PnL    : € {pnl_reale:.2f} | R-Mult: {r_mult:.2f}R")
+        api.Print(f"Entry  : {position.EntryPrice:.5f} | Close: {chiusura_effettiva:.5f}")
+        api.Print("========================")
+        # ===== GESTIONE LOSS =====
+        if pnl_reale < 0:
+            # Memorizza zona di loss
+            self.last_loss_price_zone = position.EntryPrice
+            self.loss_zone_timestamp = api.Server.Time
+            api.Print(f"🔴 ZONA LOSS MEMORIZZATA: {position.EntryPrice:.5f} ±{self.ZONE_TOLERANCE_PIPS}p")
+            # Pausa
+            if self.pause_bars_remaining == 0:
+                self.pause_bars_remaining = 2
+                api.Print(f"⏸️ PAUSA ATTIVATA: 2 candele dopo loss")
+        else:
+            # Su TP pulisci la zona (il prezzo si è spostato favorevolmente)
+            self.last_loss_price_zone = None
+            self.loss_zone_timestamp = None
+        # 5. Pulizia dei Set di gestione 
+        if hasattr(self, 'near_tp_reaches'):
+            self.near_tp_reaches.discard(position.Id)           
+
+        # 6. Controllo Circuit Breaker Giornaliero
+        current_stops = self.check_daily_stop_limit(1)
+        if current_stops:
+            api.Print("🛑 ATTENZIONE: Limite 2 Stop giornalieri raggiunto. Bot in pausa per oggi.")
+    # ======================================================
+    # HELPERS
+    # ======================================================
+    def has_position(self):
+        return any(p.SymbolName == self.symbol.Name and p.Label == "AdvancedBot" and  p.VolumeInUnits > 0 for p in api.Positions)
+
+    def has_pending_order(self):
+        return any(o.SymbolName == self.symbol.Name and o.Label == "AdvancedBot" for o in api.PendingOrders)
+
+    def get_position(self):
+        for p in api.Positions:
+            if p.SymbolName == self.symbol.Name and p.Label == "AdvancedBot":
+                return p
+        return None
+
+    def log_throttled(self, msg):
+        now = api.Server.Time
+        if not hasattr(self, "last_log_time"):
+            self.last_log_time = now
+            api.Print(msg)
+            return
+        if (now - self.last_log_time).TotalSeconds >= self.LOG_INTERVAL:
+            api.Print(msg)
+            self.last_log_time = now
+
+    def calc_volume(self, SL_PIPS, multiplier = 1.0):
+        try:
+            capital = min(self.account.Balance, self.account.Equity)
+            effective_risck_pct = self.RISK_PCT * multiplier
+            risk_amount = capital * (effective_risck_pct / 100)
+            pip_value_per_unit = self.symbol.PipValue / self.symbol.LotSize
+            raw_volume = risk_amount / (SL_PIPS * pip_value_per_unit)
+            volume = max(raw_volume, self.symbol.VolumeInUnitsMin)
+            step = self.symbol.VolumeInUnitsStep
+            volume = math.floor(volume / step) * step
+            return max(int(volume), int(self.symbol.VolumeInUnitsMin))
+        except Exception as e:
+            api.Print(f"[calc_volume ERROR] {e}")
+            return 0
+
+    def check_daily_stop_limit(self, max_stops):
+        """
+        Nuovo comportamento: dopo 1 SL, pausa fino a fine giornata.
+        Dopo 2 SL totali (inclusi i giornalieri accumulati), stop totale.
+        """
+        stops_today = 0
+        today = api.Server.Time.Date
+        
+        for history_pos in api.History:
+            if (history_pos.SymbolName == self.symbol.Name and
+                history_pos.Label == "AdvancedBot" and
+                history_pos.ClosingTime.Date == today and
+                history_pos.NetProfit < 0):
+                stops_today += 1
+        
+        # Conta posizioni aperte
+        active = sum(1 for p in api.Positions 
+                     if p.Label == "AdvancedBot" and 
+                        p.SymbolName == self.symbol.Name)
+        stops_today += active
+        
+        # Dopo il PRIMO stop: blocca il resto della giornata
+        # (non permette il secondo trade che statisticamente perde)
+        return stops_today >= 1  # era >= 2
+
+    # ===== INDICATORI CUSTOM =====
+    def ema(self, values, period):
+        # Versione ottimizzata per High-Frequency
+        if len(values) < period: return [values[-1]] * len(values) if values else []
+        # Fattore di decadimento
+        alpha = 2.0 / (period + 1.0)   
+        # Calcolo SMA iniziale per il primo punto
+        sma_start = sum(values[:period]) / period   
+        result = [sma_start]       
+        # Calcolo iterativo veloce
+        # Usiamo l'ultimo valore calcolato (result[-1]) per il prossimo
+        for v in values[period:]:
+            # Formula EMA: (Close - PrevEMA) * alpha + PrevEMA
+            val = (v - result[-1]) * alpha + result[-1]
+            result.append(val)           
+        # Padding: Aggiungiamo zeri all'inizio per mantenere la lunghezza della lista originale
+        # Così ema[-1] corrisponde a values[-1]
+        return [0.0] * (period - 1) + result
+
+    def ema_rsi(self, prices, period=14):
+        if len(prices) < period + 1:
+            return [None] * len(prices)
+        # 1️⃣ calcolo delta
+        deltas = []
+        for i in range(1, len(prices)):
+            deltas.append(prices[i] - prices[i - 1])
+        # 2️⃣ separa gains / losses
+        gains = [max(d, 0) for d in deltas]
+        losses = [max(-d, 0) for d in deltas]
+        # 3️⃣ EMA helper
+        def ema(values, period):
+            ema_vals = [None] * len(values)
+            k = 2 / (period + 1)
+            # inizializzazione con SMA
+            sma = sum(v for v in values[:period] if v is not None) / period
+            ema_vals[period - 1] = sma
+            for i in range(period, len(values)):
+                if ema_vals[i - 1] is None:
+                    ema_vals[i] = values[i]
+                else:
+                    ema_vals[i] = values[i] * k + ema_vals[i - 1] * (1 - k)
+            return ema_vals
+        ema_gain = ema(gains, period)
+        ema_loss = ema(losses, period)
+        # 4️⃣ RSI
+        rsi = [None] * len(prices)
+        for i in range(len(gains)):
+            if ema_gain[i] is None or ema_loss[i] is None:
+                continue
+            rs = ema_gain[i] / max(ema_loss[i], 1e-9)
+            rsi[i + 1] = 100 - (100 / (1 + rs))
+        # 5️⃣ fill iniziale neutro
+        for i in range(len(rsi)):
+            if rsi[i] is None:
+                rsi[i] = 50
+        return rsi
+
+    def calcolo_atr(self, high, low, close, period=10):
+        try:
+            if len(high) < period + 1:
+                return [None] * len(high)
+            tr = []
+            for i in range(1, len(high)):
+                tr.append(
+                    max(
+                        high[i] - low[i],
+                        abs(high[i] - close[i-1]),
+                        abs(low[i] - close[i-1])))
+            atr = [None] * period
+            for i in range(period, len(tr)):
+                atr.append(sum(tr[i-period:i]) / period)
+            return atr
+        except Exception as e:
+            api.Print(f"Errore calcolo atr: {e}")
+            return None
+
+    def simple_reversal_long(self, open_, close, atr, ema_fast, ema_fast_5m):
+        pos = self.get_position()
+        if pos:
+            entry = pos.EntryPrice
+            sl = pos.StopLoss
+            if sl is None: return False
+            rischio = abs(entry - sl)
+            prezzo = self.symbol.Bid
+            profit_R = (prezzo - entry) / rischio
+            
+            # Non uscire mai prima di 0.7R di profitto
+            # Sotto quella soglia, lascia che SL decida
+            if profit_R < 0.7:
+                return False
+        # 1. Candela rossa forte
+        body_size = open_[-1] - close[-1]
+        avg_body_3 = self.get_avg_body_size(open_, close, 3)
+        
+        strong_red = body_size > avg_body_3 * 1.5  # Candela 50% più grande
+        
+        if not strong_red:
+            return False  # Se candela non è forte, no exit
+        
+        # 2. MATEMATICA: Hurst sta decelerando?
+        # (Se posizione è aperta, hai già close, calcola hurst)
+        if len(close) >= 8:  # Serve periodo 10 + 3
+            hurst_now = self.get_fractal_efficiency(close, 10)
+            hurst_prev = self.get_fractal_efficiency(close[:-3], 10)
+            
+            if hurst_prev > 0:
+                hurst_acc = (hurst_now - hurst_prev) / hurst_prev
+                
+                # Se Hurst decelera < -10%, direzione persa
+                if hurst_acc < -0.20:
+                    api.Print(f"EXIT MATH: Hurst decel {hurst_acc:.2f}")
+                    return True
+        
+        # 3. STRUTTURA: Prezzo chiude sotto EMA fast?
+        if close[-1] < ema_fast_5m[-1]:
+            # E inoltre rompe minimo precedente
+            if close[-1] < min(close[-2], open_[-2]):
+                api.Print(f"EXIT STRUCT: Sotto EMA + rottura minimo")
+                return True       
+        return False
+
+    def simple_reversal_short(self, open_, close, atr, ema_fast, ema_fast_5m):   
+        pos = self.get_position()
+        if pos:
+            entry = pos.EntryPrice
+            sl = pos.StopLoss
+            if sl is None: return False
+            rischio = abs(entry - sl)
+            prezzo = self.symbol.Bid
+            profit_R = (entry - prezzo) / rischio
+            
+            # Non uscire mai prima di 0.7R di profitto
+            # Sotto quella soglia, lascia che SL decida
+            if profit_R < 0.7:
+                return False
+         # 1. Candela verde forte
+        body_size = close[-1] - open_[-1]
+        avg_body_3 = self.get_avg_body_size(open_, close, 3)        
+        strong_green = body_size > avg_body_3 * 1.5       
+        if not strong_green:
+            return False        
+        # 2. Hurst decelera
+        if len(close) >= 8:
+            hurst_now = self.get_fractal_efficiency(close, 10)
+            hurst_prev = self.get_fractal_efficiency(close[:-3], 10)           
+            if hurst_prev > 0:
+                hurst_acc = (hurst_now - hurst_prev) / hurst_prev                
+                if hurst_acc < -0.20:
+                    api.Print(f"EXIT MATH: Hurst decel {hurst_acc:.2f}")
+                    return True       
+        # 3. Struttura rotta
+        if close[-1] > ema_fast_5m[-1]:
+            if close[-1] > max(close[-2], open_[-2]):
+                api.Print(f"EXIT STRUCT: Sopra EMA + rottura massimo")
+                return True
+        
+        return False
+
+    # ===== HELPER PER FAR FUNZIONARE BOT =====
+    def normalize_price(self, price):
+        return math.floor(price / self.symbol.TickSize) * self.symbol.TickSize
+
+    def calc_R(self, position):
+        return abs(position.EntryPrice - position.StopLoss) / self.symbol.PipSize
+
+    def atr_mean(self, atr, period=4):
+        clean = [v for v in atr if v is not None]
+        if len(clean) < period:
+            return clean[-1] if clean else 0
+        return sum(clean[-period:]) / period
+
+    # ===== FUNZIONI PER STRATEGIA BOT =====
+    def trading_time_allowed(self):
+        t = api.Server.Time
+        h = t.Hour
+        m = t.Minute
+        # Sessione NY
+        if (h == 14 and m >= 35) or (15 <= h < 16) or (h==17 and m>=30) or (h==18) or (h== 19 and m<= 30):
+            return True
+
+    def trading_setup_allowed(self):
+        t = api.Server.Time
+        h = t.Hour
+        m = t.Minute
+        start_condition = (h > 13) or (h == 13 and m >= 30)       
+        # Orario End: Fino alle 21:30
+        end_condition = (h < 21) or (h == 21 and m <= 30)      
+        # Deve soddisfare entrambe
+        return start_condition and end_condition
+
+    def get_monthly_status(self, profit_target_pct=5.0, soft_dd_pct=2.0, hard_dd_pct=4.0):
+        """
+        Gestisce lo stato del mese con logica RESET su 2 TP consecutivi.
+        - Restituisce 0: Rischio Normale (1.0)
+        - Restituisce 1: Profit Lock (Target Mensile Raggiunto)
+        - Restituisce 2: Hard Stop (Mese Perso > 4%)
+        - Restituisce 0.5: Recovery Mode (Rischio Dimezzato > 2%)
+        """
+        # Accesso sicuro ai dati globali cTrader
+        now = api.Server.Time
+        current_month = now.Month
+        current_year = now.Year    
+        # Recupero storico filtrato (Solo mese corrente, solo questo Bot)
+        monthly_trades = [
+            h for h in api.History 
+            if h.Label == "AdvancedBot" 
+            and h.ClosingTime.Month == current_month
+            and h.ClosingTime.Year == current_year]      
+        # Ordiniamo cronologicamente (dal più vecchio al più recente)
+        monthly_trades.sort(key=lambda x: x.ClosingTime)       
+        # Calcoli di base
+        total_pnl = sum(t.NetProfit for t in monthly_trades)
+        start_balance = api.Account.Balance - total_pnl      
+        if start_balance <= 0: return 0 # Sicurezza contro divisione per zero    
+        # Percentuale attuale rispetto all'inizio mese
+        # Esempio: Se Balance 10000 e PnL -300 -> current_pct = -3.0
+        current_pct = (total_pnl / start_balance) * 100.0       
+        # 1. CONTROLLO HARD STOP (-4%)
+        # Se siamo sotto il -4%, fine dei giochi. Priorità assoluta.
+        if current_pct <= -hard_dd_pct:
+            return 2 # STOP TOTALE
+        # 2. CONTROLLO PROFIT LOCK (Opzionale: Protezione guadagni)
+        # Se vuoi mantenere la logica che blocca se tocchi il +5% e poi perdi
+        target_money = start_balance * (profit_target_pct / 100.0)
+        hit_target = False
+        running_pnl = 0.0
+        tolleranza = start_balance * 0.002       
+        for t in monthly_trades:
+            running_pnl += t.NetProfit
+            if running_pnl >= target_money: hit_target = True
+            # Se avevamo toccato il target e ora prendiamo uno stop
+            if hit_target and t.NetProfit < -tolleranza:
+                return 1 # STOP (Profit Lock)
+        # 3. CONTROLLO SOFT DRAWDOWN (-2%) con LOGICA RESET
+        if current_pct <= -soft_dd_pct:        
+            # Siamo sotto il -2%. Di base dovremmo dimezzare il rischio.
+            # MA controlliamo se abbiamo fatto 2 TP consecutivi recenti.         
+            reset_triggered = False         
+            if len(monthly_trades) >= 2:
+                last_trade = monthly_trades[-1] # L'ultimo chiuso
+                prev_trade = monthly_trades[-2] # Il penultimo chiuso             
+                # Se entrambi sono positivi (Take Profit)
+                if last_trade.NetProfit > 0 and prev_trade.NetProfit > 0:
+                    reset_triggered = True          
+            if reset_triggered:
+                return 0 # RISCHIO NORMALE (Reset avvenuto!)
+            else:
+                return 0.5 # RISCHIO DIMEZZATO (Siamo ancora in difficoltà)
+        # Se va tutto bene (sopra il -2%)
+        return 0 # NORMALE
+        
+    def get_percentile(self, values, period):
+        """Percentile del valore attuale rispetto agli ultimi N periodi"""
+        if len(values) < period:
+            return 50
+        current = values[-1]
+        window = [values[-i] for i in range(1, period + 1)]
+        rank = sum(1 for v in window if v <= current)
+        return int(rank / period * 100)
+
+    # Calcola la media dei corpi (valore assoluto) delle ultime N candele
+    def get_avg_body_size(self, open_, close, period):
+        """Media dei corpi delle ultime N candele"""
+        if len(close) < period + 1: 
+            return 0.0       
+        total_body = 0.0
+        for i in range(1, period + 1):
+            total_body += abs(close[-i] - open_[-i])        
+        return total_body / period  
+         
+    def get_volatility_percentile(self, atr, period=20):
+        """Dove si trova l'ATR attuale rispetto al range recente?"""
+        recent = [a for a in atr[-period:] if a is not None]
+        if len(recent) < period: return 50       
+        current = recent[-1]
+        rank = sum(1 for v in recent if v <= current)
+        return (rank / period) * 100
+
+    def get_fractal_efficiency(self, close, period=10): #Quanto è efficiente il movimento? Va dritto o zigzaga?
+        change = abs(close[-1] - close[-period]) # Spostamento netto
+        path_length = 0.0       
+        for i in range(1, period + 1):
+            path_length += abs(close[-i] - close[-i-1]) # Somma di tutti i passettini             
+        if path_length == 0: return 0.0        
+        return change / path_length
+
+    def get_hurst_acceleration(self, close, period=10):
+        """Sta aumentando la direzionalità? (Impulso nascente)"""
+        if len(close) < period + 3:
+            return 0.0        
+        hurst_now = self.get_fractal_efficiency(close, period)
+        hurst_prev = self.get_fractal_efficiency(close[:-3], period)       
+        if hurst_prev == 0: 
+            return 0.0    
+        # Differenza assoluta: range stabile -0.20 / +0.20    
+        return hurst_now - hurst_prev
+
+    def get_bollinger_squeeze(self, close, period=20, std_dev=2, pct_lookback=20):
+        """Combina posizione + compressione Bollinger + percentile BBw"""
+        sma = sum(close[-period:]) / period
+        variance = sum([(c - sma)**2 for c in close[-period:]]) / period
+        std = math.sqrt(variance)        
+        upper = sma + (std * std_dev)
+        lower = sma - (std * std_dev)       
+        # %B: Dove siamo nel canale? (0-100)
+        price = close[-1]
+        percent_b = ((price - lower) / (upper - lower)) * 100 if upper != lower else 50        
+        # Bandwidth: Quanto è stretto il canale?
+        bandwidth = ((upper - lower) / sma) * 100        
+        
+        # BBw Percentile: rolling su ultime pct_lookback candele
+        bbw_pct = 50  # default
+        if len(close) >= period + pct_lookback:
+            bw_history = []
+            for i in range(pct_lookback):
+                offset = pct_lookback - 1 - i
+                chunk = close[-(period + offset):len(close) - offset] if offset > 0 else close[-period:]
+                s = sum(chunk) / period
+                v = sum([(c - s)**2 for c in chunk]) / period
+                st = math.sqrt(v)
+                u = s + (st * std_dev)
+                l = s - (st * std_dev)
+                bw_history.append(((u - l) / s) * 100 if s != 0 else 0)
+            
+            count = sum(1 for bw in bw_history if bw <= bandwidth)
+            bbw_pct = (count / pct_lookback) * 100
+        
+        return percent_b, bandwidth, bbw_pct
+
+    def get_quick_acceleration(self, close):
+        """
+        🆕 VELOCE: Accelerazione su 3 bar (15 min) invece di 10 bar (50 min)
+        
+        Confronta:
+        - Momentum ADESSO (ultimi 3 bar: -1 a -3)
+        - Momentum PRIMA (3 bar precedenti: -4 a -6)
+        
+        Output: numero (tipicamente -0.01 a +0.01)
+        - Positivo = sta accelerando
+        - Negativo = sta decelerando
+        """
+        if len(close) < 7:
+            return 0.0
+        
+        # Momentum recente (ultimi 3 bar)
+        momentum_now = (close[-1] - close[-3]) / close[-3]
+        
+        # Momentum precedente (3 bar prima)
+        momentum_prev = (close[-4] - close[-6]) / close[-6]
+        
+        # Accelerazione = differenza
+        acceleration = momentum_now - momentum_prev
+        
+        return acceleration
+
+    def calc_ADX(self, high, low, close, period=14):
+        """ADX con smoothing Wilder corretto. Restituisce (adx, plus_di, minus_di)."""
+        if len(close) < period * 2 + 1:
+            return 0.0, 0.0, 0.0
+
+        tr_list, plus_dm_list, minus_dm_list = [], [], []
+
+        for i in range(1, len(close)):
+            tr = max(
+                high[i] - low[i],
+                abs(high[i] - close[i - 1]),
+                abs(low[i] - close[i - 1])
+            )
+            tr_list.append(tr)
+
+            up_move   = high[i] - high[i - 1]
+            down_move = low[i - 1] - low[i]
+
+            if up_move > down_move and up_move > 0:
+                plus_dm_list.append(up_move)
+            else:
+                plus_dm_list.append(0.0)
+
+            if down_move > up_move and down_move > 0:
+                minus_dm_list.append(down_move)
+            else:
+                minus_dm_list.append(0.0)
+
+        if len(tr_list) < period:
+            return 0.0, 0.0, 0.0
+
+        atr_w      = sum(tr_list[:period])
+        plus_dm_w  = sum(plus_dm_list[:period])
+        minus_dm_w = sum(minus_dm_list[:period])
+
+        dx_list = []
+        plus_di, minus_di = 0.0, 0.0
+
+        for i in range(period, len(tr_list)):
+            atr_w      = atr_w      - (atr_w / period)      + tr_list[i]
+            plus_dm_w  = plus_dm_w  - (plus_dm_w / period)  + plus_dm_list[i]
+            minus_dm_w = minus_dm_w - (minus_dm_w / period) + minus_dm_list[i]
+
+            if atr_w == 0:
+                continue
+
+            plus_di  = (plus_dm_w / atr_w) * 100
+            minus_di = (minus_dm_w / atr_w) * 100
+
+            di_sum = plus_di + minus_di
+            dx_list.append(0.0 if di_sum == 0 else abs(plus_di - minus_di) / di_sum * 100)
+
+        if len(dx_list) < period:
+            return 0.0, plus_di, minus_di
+
+        adx = sum(dx_list[:period]) / period
+        for dx_val in dx_list[period:]:
+            adx = (adx * (period - 1) + dx_val) / period
+
+        return adx, plus_di, minus_di
+
+    #======================================
+    def check_trigger(self, close, atr):
+        bb_b, bb_w, bb_w_pct   = self.get_bollinger_squeeze(close, 20, 2, 20)
+        accel = self.get_quick_acceleration(close)
+        hurst = self.get_fractal_efficiency(close, 10)
+        hurst_acc = self.get_hurst_acceleration(close)
+        vol_pct = self.get_volatility_percentile(atr, 20)
+
+        # Filtro Efficienza: Il grafico deve essere "pulito"       
+        if self.trend_bias == "LONG":
+            if hurst < 0.45: return False, ""
+
+            # Prezzo spinge in alto e accelera
+            if bb_b > 85 and accel > 0.001:
+                return True, "L-ACCEL"
+
+            if bb_b > 80 and hurst_acc < -0.05 and vol_pct > 30:
+                return True, "L-DECEL"
+                
+        if self.trend_bias == "SHORT":
+            if hurst < 0.35: return False, ""
+
+            # Prezzo spinge in basso e accelera
+            if bb_b < 10 and accel < -0.001:
+                return True, "S-ACCEL"            
+        return False, ""
+    #======================================
+    def check_setup(self, close, high, low, ema_fast_5m, ema_slow_5m, atr):
+        # 1. Direzione Medie ed ADX
+        adx, _, _ = self.calc_ADX(high, low, close, 14)
+        atr_cur = self.atr_mean(atr, 5)
+        
+        # Filtro ADX: Trend presente ma non esausto
+        trend_healthy = 25 <= adx <= 65
+        
+        # Filtro Volatilità: Evitiamo i picchi folli (esaurimento)
+        bb_b, bb_w, bb_w_pct   = self.get_bollinger_squeeze(close, 20, 2, 20)
+        regime_ok = 20 < bb_w_pct <= 80 
+
+        structure_long_ok = ema_fast_5m[-1] > ema_slow_5m[-1]
+        safe_dist_long = (ema_fast_5m[-1] - ema_slow_5m[-1]) > (atr_cur * 0.3)
+
+        if structure_long_ok and safe_dist_long and trend_healthy and regime_ok:
+            self.trend_bias = "LONG"
+            api.Print("BIAS -> LONG")
+            return True
+            
+        else:
+            structure_short_ok = ema_fast_5m[-1] < ema_slow_5m[-1]
+            safe_dist_short = (ema_slow_5m[-1] - ema_fast_5m[-1]) > (atr_cur * 0.3)
+
+            if structure_short_ok and safe_dist_short and trend_healthy and regime_ok:
+                self.trend_bias = "SHORT"
+                api.Print("BIAS -> SHORT")
+                return True
+            
+        return False
+    # ===== FUNZIONI ENTRY FINALE ===== 
+    # ======================================================
+    # ENTRY TRIGGER — LONG 
+    # ======================================================
+    def early_long_trigger(self, current_bid, current_ask, prices,
+                            ema_fast_5m, ema_slow_5m, open_, high, low,
+                            close, atr, ema_fast):
+
+        # ── GUARDIE RAPIDE ──────────────────────────────────────────
+        if not self.trading_time_allowed():
+            return False, 0.0, 1.8
+        if self._is_in_loss_zone(current_ask):
+            return False, 0.0, 1.8
+
+        # ── CALCOLO INDICATORI ──────────────────────────────────────
+        vol_pct   = self.get_volatility_percentile(atr, 20)
+        bb_b, bb_w, bb_w_pct   = self.get_bollinger_squeeze(close, 20, 2, 20)
+        hurst     = self.get_fractal_efficiency(close, 10)
+        hurst_acc = self.get_hurst_acceleration(close)
+        atr_cur   = self.atr_mean(atr, 5)
+        adx, _, _ = self.calc_ADX(high, low, close, 7)
+
+        # ── TRIGGER REALE ───────────────
+        puo_entrare, motivo = self.check_trigger(close, atr)
+        if not puo_entrare:
+            return False, 0.0, 1.8
+
+        # ── CALCOLO ENTRY E SL ──────────────────────────────────────
+        local_high   = api.Bars.HighPrices.Last(1)
+        atr_buffer   = atr_cur * 0.085
+        entry_price  = local_high + atr_buffer
+
+        sl_structural    = max(low[-2], ema_slow_5m[-2])
+        sl_distance_pips = (entry_price - sl_structural) / self.symbol.PipSize
+
+        if sl_distance_pips <= 0:
+            return False, 0.0, 1.8
+        if not (self.sl_min <= sl_distance_pips <= self.MAX_SL_PIPS):
+            return False, 0.0, 1.8
+
+        # Gap entry: se devo salire più di 10 pips per entrare
+        # in 20 minuti è improbabile che scatti
+        gap_pips = (entry_price - current_ask) / self.symbol.PipSize
+        if gap_pips > 10:
+            return False, 0.0, 1.8
+
+        # ── RR ADATTIVO basato su forza del trend ───────────────────
+        if  hurst > 0.6:
+            rr = 2.0
+        else:
+            rr = 1.7
+
+        self.planned_sl_pips     = sl_distance_pips
+        self.planned_entry_price = entry_price
+        self.rr = rr
+
+        api.Print(f"📊 BBw:{bb_w:.2f}, BBb:{bb_b:.2f} V:{vol_pct:.0f} H:{hurst:.2f} Ha:{hurst_acc:.3f} ADX:{adx:.0f} Dir:LONG | {motivo}, rr:{rr}")
+
+        return True, entry_price, rr
+
+    # ======================================================
+    # ENTRY TRIGGER — SHORT 
+    # ======================================================
+    def early_short_trigger(self, current_bid, current_ask, prices,
+                             ema_fast_5m, ema_slow_5m, open_, low, high,
+                             close, atr, ema_fast):
+        # ── GUARDIE RAPIDE ──────────────────────────────────────────
+        if not self.trading_time_allowed():
+            return False, 0.0, 1.8
+        if self._is_in_loss_zone(current_ask):
+            return False, 0.0, 1.8
+
+        # ── CALCOLO INDICATORI ──────────────────────────────────────
+        vol_pct   = self.get_volatility_percentile(atr, 20)
+        bb_b, bb_w, bb_w_pct   = self.get_bollinger_squeeze(close, 20, 2, 20)
+        hurst     = self.get_fractal_efficiency(close, 10)
+        hurst_acc = self.get_hurst_acceleration(close)
+        atr_cur   = self.atr_mean(atr, 5)
+        adx, _, _ = self.calc_ADX(high, low, close, 7)
+        # ── TRIGGER REALE ───────────────
+        puo_entrare, motivo = self.check_trigger(close, atr)
+        if not puo_entrare:
+            return False, 0.0, 1.8   
+        # ── CALCOLO ENTRY E SL ──────────────────────────────────────
+        local_low    = api.Bars.LowPrices.Last(1)
+        atr_buffer   = atr_cur * 0.085
+        entry_price  = local_low - atr_buffer
+
+        sl_structural    = min(high[-2], ema_slow_5m[-2])
+        sl_distance_pips = (sl_structural - entry_price) / self.symbol.PipSize
+
+        if sl_distance_pips <= 0:
+            return False, 0.0, 1.8
+        if not (self.sl_min <= sl_distance_pips <= self.MAX_SL_PIPS):
+            return False, 0.0, 1.8
+
+        gap_pips = (current_bid - entry_price) / self.symbol.PipSize
+        if gap_pips > 10:
+            return False, 0.0, 1.8
+
+        # RR adattivo 
+        if hurst > 0.6:
+            rr = 2.0
+        else:
+            rr = 1.7
+
+        self.planned_sl_pips     = sl_distance_pips
+        self.planned_entry_price = entry_price
+        self.rr = rr
+
+        api.Print(f"📊 BBw:{bb_w:.2f}, BBb:{bb_b:.2f} V:{vol_pct:.0f} H:{hurst:.2f} Ha:{hurst_acc:.3f} ADX:{adx:.0f} Dir: SHORT | {motivo}, rr:{rr}")
+
+        return True, entry_price, rr
