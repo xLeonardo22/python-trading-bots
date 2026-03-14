@@ -1,3 +1,23 @@
+# ============================================================
+# BOT: Market Auto Analysis — BotTradingM5
+# Platform: cTrader API (Python)
+# Author: Leonardo [Cognome]
+# Markets: Nasdaq (US100) / S&P500 (US500)
+#
+# Description:
+#   Algorithmic trading bot operating on M5 timeframe.
+#   Implements from scratch: EMA, ATR, ADX (Wilder smoothing),
+#   Hurst Fractal Efficiency, Bollinger Bands with dynamic
+#   BBw percentile, and multi-level risk management.
+#
+# Computational techniques:
+#   - Time series analysis and exponential smoothing
+#   - Fractal efficiency analysis (Hurst Index)
+#   - Descriptive statistics (percentiles, relative volatility)
+#   - Object-oriented programming (OOP)
+#   - Asynchronous event handling (OnTick / OnBar)
+# ============================================================
+
 import clr
 clr.AddReference("cAlgo.API")
 from cAlgo.API import *
