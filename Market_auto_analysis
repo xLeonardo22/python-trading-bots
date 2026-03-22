@@ -2,7 +2,7 @@
 # BOT: Market Auto Analysis — BotTradingM5
 # Platform: cTrader API (Python)
 # Author: Leonardo
-# Markets: Nasdaq (US100) / S&P500 (US500)
+# Markets: Nasdaq (US100)
 #
 # Description:
 #   Algorithmic trading bot operating on the M5 timeframe.
