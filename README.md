@@ -91,8 +91,9 @@ This bot runs natively inside the cTrader platform:
 *Due to computational constraints, backtests are split into two periods.*
 
 **2022–2023**
-![Backtest 2022-2023](backtest_2022_2023.png)
+<img width="2874" height="1685" alt="Captura de pantalla 2026-03-24 183348" src="https://github.com/user-attachments/assets/e33b0c60-72f5-4e0c-855b-31a9b5b24cc9" />
+
 
 **2024–2025**
-<img width="2874" height="1685" alt="image" src="https://github.com/user-attachments/assets/d5d91173-9daf-48e7-95d4-9494f64c62d4" />
+<img width="2879" height="1682" alt="image" src="https://github.com/user-attachments/assets/ca8a4455-9e9c-418d-91c0-63045e1b7c89" />
 
