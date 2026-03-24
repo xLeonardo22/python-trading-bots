@@ -18,7 +18,7 @@ That failure led me to rethink the core logic. v2 adopts a momentum-following
 strategy: instead of predicting direction, the algorithm waits for compression
 phases and enters only on confirmed volume expansion breakouts. It also processes
 market data faster and generates more selective signals. The 4-year backtest —
-including 2022 — returned 8% overall profit.
+including 2022 — returned 3% overall profit (ongoing development — current version under live testing).
 
 ---
 
@@ -94,5 +94,5 @@ This bot runs natively inside the cTrader platform:
 ![Backtest 2022-2023](backtest_2022_2023.png)
 
 **2024–2025**
-![Backtest 2024-2025]<img width="2879" height="1683" alt="image" src="https://github.com/user-attachments/assets/7afa2acb-348b-48a7-8410-fa9c5b2c1bd6" />
-)
+<img width="2874" height="1685" alt="image" src="https://github.com/user-attachments/assets/d5d91173-9daf-48e7-95d4-9494f64c62d4" />
+
