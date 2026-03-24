@@ -85,3 +85,14 @@ This bot runs natively inside the cTrader platform:
 
 > No external dependencies required — all indicators are implemented
 > from scratch using Python's standard library only.
+>
+## Backtest results (MomentumBot v2)
+
+*Due to computational constraints, backtests are split into two periods.*
+
+**2022–2023**
+![Backtest 2022-2023](backtest_2022_2023.png)
+
+**2024–2025**
+![Backtest 2024-2025]<img width="2879" height="1683" alt="image" src="https://github.com/user-attachments/assets/7afa2acb-348b-48a7-8410-fa9c5b2c1bd6" />
+)
