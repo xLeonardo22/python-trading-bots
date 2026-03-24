@@ -45,7 +45,7 @@ ranging market conditions more reliably, which was the core weakness of v1.
 
 | Indicator | Bot | Purpose |
 |-----------|-----|---------|
-| Exponential Moving Average (EMA) | v1, v2 | Trend direction and bias detection |
+| Exponential Moving Average (EMA) | v1 | Trend direction and bias detection |
 | Average True Range (ATR) | v1, v2 | Volatility measurement and SL sizing |
 | Average Directional Index (ADX) | v1, v2 | Trend strength filter |
 | Hurst Fractal Efficiency Index | v1, v2 | Measures directional efficiency of price movement |
